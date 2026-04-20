@@ -145,6 +145,12 @@ type State struct {
 
 	// offline state sync height indicating to which height the node synced offline
 	offlineStateSyncHeight int64
+
+	// locabft: startupBlockCommitted is false at every node start. The first
+	// committed block flips it to true. Until then, needCommitBlock forces one
+	// empty block so the ABCI app executes FinalizeBlock and refreshes its
+	// module state (mint, staking, distribution) before user txs arrive.
+	startupBlockCommitted bool
 }
 
 // StateOption sets an optional parameter on the State.
@@ -983,6 +989,8 @@ func (cs *State) handleTimeout(ti timeoutInfo, rs cstypes.RoundState) {
 		cs.enterNewRound(ti.Height, 0)
 
 	case cstypes.RoundStepNewRound:
+		cs.Logger.Info("[locabft] keepalive: interval elapsed, proposing empty block",
+			"height", ti.Height, "round", ti.Round)
 		cs.enterPropose(ti.Height, ti.Round)
 
 	case cstypes.RoundStepPropose:
@@ -1023,7 +1031,7 @@ func (cs *State) handleTxsAvailable() {
 
 	switch cs.Step {
 	case cstypes.RoundStepNewHeight: // timeoutCommit phase
-		if cs.needProofBlock(cs.Height) {
+		if cs.needCommitBlock(cs.Height) {
 			// enterPropose will be called by enterNewRound
 			return
 		}
@@ -1033,6 +1041,8 @@ func (cs *State) handleTxsAvailable() {
 		cs.scheduleTimeout(timeoutCommit, cs.Height, 0, cstypes.RoundStepNewRound)
 
 	case cstypes.RoundStepNewRound: // after timeoutCommit
+		cs.Logger.Info("[locabft] txs available, proposing block",
+			"height", cs.Height)
 		cs.enterPropose(cs.Height, 0)
 	}
 }
@@ -1099,35 +1109,56 @@ func (cs *State) enterNewRound(height int64, round int32) {
 	if err := cs.eventBus.PublishEventNewRound(cs.NewRoundEvent()); err != nil {
 		cs.Logger.Error("failed publishing new round", "err", err)
 	}
-	// Wait for txs to be available in the mempool
-	// before we enterPropose in round 0. If the last block changed the app hash,
-	// we may need an empty "proof" block, and enterPropose immediately.
-	waitForTxs := cs.config.WaitForTxs() && round == 0 && !cs.needProofBlock(height)
+	// locabft: needCommitBlock replaces the upstream needProofBlock.
+	// needProofBlock triggered an infinite empty-block loop on Cosmos SDK chains
+	// because BeginBlocker modules (mint, distribution, staking) modify AppHash
+	// on every block. needCommitBlock only forces blocks when truly necessary.
+	waitForTxs := cs.config.WaitForTxs() && round == 0 && !cs.needCommitBlock(height)
 	if waitForTxs {
 		if cs.config.CreateEmptyBlocksInterval > 0 {
+			logger.Info("[locabft] waiting for txs",
+				"keepalive_interval", cs.config.CreateEmptyBlocksInterval)
 			cs.scheduleTimeout(cs.config.CreateEmptyBlocksInterval, height, round,
 				cstypes.RoundStepNewRound)
+		} else {
+			logger.Info("[locabft] waiting for txs, no keepalive configured")
 		}
 	} else {
+		if round == 0 && cs.needCommitBlock(height) {
+			logger.Info("[locabft] commit block: recording AppHash after txs")
+		}
 		cs.enterPropose(height, round)
 	}
 }
 
-// needProofBlock returns true on the first height (so the genesis app hash is signed right away)
-// and where the last block (height-1) caused the app hash to change
-func (cs *State) needProofBlock(height int64) bool {
+// needCommitBlock returns true when a block must be produced even without
+// pending transactions. Three cases:
+//  1. Genesis height — so the initial AppHash is recorded in a block header.
+//  2. First block after restart — forces FinalizeBlock so Cosmos SDK modules
+//     (mint, staking, distribution) refresh their in-memory state before user
+//     transactions arrive. Without this, txs submitted right after startup may
+//     be rejected against stale module state.
+//  3. Previous block contained transactions — one empty "commit" block records
+//     the resulting AppHash in the next header. The commit block itself has
+//     NumTxs==0, so needCommitBlock returns false for the block after it,
+//     breaking the loop.
+func (cs *State) needCommitBlock(height int64) bool {
 	if height == cs.state.InitialHeight {
+		return true
+	}
+
+	if !cs.startupBlockCommitted {
+		cs.Logger.Info("[locabft] startup block: warming ABCI app state",
+			"height", height)
 		return true
 	}
 
 	lastBlockMeta := cs.blockStore.LoadBlockMeta(height - 1)
 	if lastBlockMeta == nil {
-		// See https://github.com/cometbft/cometbft/issues/370
-		cs.Logger.Info("short-circuited needProofBlock", "height", height, "InitialHeight", cs.state.InitialHeight)
 		return true
 	}
 
-	return !bytes.Equal(cs.state.AppHash, lastBlockMeta.Header.AppHash)
+	return lastBlockMeta.NumTxs > 0
 }
 
 // Enter (CreateEmptyBlocks): from enterNewRound(height,round)
@@ -1367,6 +1398,13 @@ func (cs *State) defaultDoPrevote(height int64, round int32) {
 		cs.signAddVote(cmtproto.PrevoteType, nil, types.PartSetHeader{}, nil)
 		return
 	}
+
+	// locabft: empty-block prevote guard (inactive, kept for reference).
+	/* txs := cs.ProposalBlock.Data.Txs.ToSliceOfBytes()
+	if len(txs) == 0 {
+		logger.Info("[locabft] defaultDoPrevote: rejecting empty block proposal")
+		return
+	} */
 
 	/*
 		Before prevoting on the block received from the proposer for the current round and height,
@@ -1783,6 +1821,14 @@ func (cs *State) finalizeCommit(height int64) {
 
 	fail.Fail() // XXX
 
+	// locabft: mark that a block has been committed this session so
+	// needCommitBlock stops forcing the startup warm-up block.
+	if !cs.startupBlockCommitted {
+		cs.startupBlockCommitted = true
+		cs.Logger.Info("[locabft] startup block: ABCI app state ready",
+			"height", height)
+	}
+
 	// must be called before we update state
 	cs.recordMetrics(height, block)
 
@@ -2017,6 +2063,13 @@ func (cs *State) addProposalBlockPart(msg *BlockPartMessage, peerID p2p.ID) (add
 
 		cs.ProposalBlock = block
 
+		// locabft: empty-block guard at addProposalBlockPart (inactive, kept for reference).
+		/* txs := cs.ProposalBlock.Data.Txs.ToSliceOfBytes()
+		if len(txs) == 0 {
+			cs.Logger.Info("[locabft] addProposalBlockPart: rejecting empty block")
+			return false, nil
+		}
+		*/
 		// NOTE: it's possible to receive complete proposal blocks for future rounds without having the proposal
 		cs.Logger.Info("received complete proposal block", "height", cs.ProposalBlock.Height, "hash", cs.ProposalBlock.Hash())
 
