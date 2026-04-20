@@ -45,7 +45,6 @@ returns to wait mode and schedules the next keepalive.
 | File | Change |
 |------|--------|
 | `consensus/state.go` | Replace `needProofBlock` with `needCommitBlock`; add `startupBlockCommitted` warm-up field; add `[locabft]` log messages |
-| `state/execution.go` | Add `startupBlockCommitted` field to `BlockExecutor` (inactive — kept for reference) |
 
 All fork-specific code is tagged with `locabft:` in comments and `[locabft]` in log
 messages, making it easy to identify changes with `grep` and to filter logs on validators:
@@ -62,6 +61,43 @@ docker logs val-hana 2>&1 | grep "\[locabft\]"
 | `[locabft] txs available, proposing block` | New txs in mempool |
 | `[locabft] commit block: recording AppHash after txs` | Empty block to record AppHash |
 | `[locabft] keepalive: interval elapsed, proposing empty block` | Periodic keepalive block |
+
+## Using this fork in your project
+
+### `go.mod` replace directive
+
+```go
+replace (
+    github.com/cometbft/cometbft v0.38.17 => github.com/localitynetwork/locabft v0.38.17-loca.0
+)
+```
+
+No imports need to change — all `github.com/cometbft/cometbft/...` paths resolve
+automatically via the `replace` directive.
+
+### GONOSUMDB
+
+Go verifies module hashes against the public transparency log at `sum.golang.org`.
+Because `localitynetwork/locabft` may not be indexed there yet, builds on a fresh machine
+can fail with:
+
+```
+verifying github.com/localitynetwork/locabft@v0.38.17-loca.0:
+  checksum mismatch or not found in sum database
+```
+
+This is not a security risk — the `go.sum` file in your project already contains the
+correct hashes and protects against tampering. To skip the external lookup, set:
+
+```bash
+go env -w GONOSUMDB=github.com/localitynetwork/*
+```
+
+Or per-command:
+
+```bash
+GONOSUMDB=github.com/localitynetwork/* go install ./...
+```
 
 ---
 
