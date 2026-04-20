@@ -1399,13 +1399,6 @@ func (cs *State) defaultDoPrevote(height int64, round int32) {
 		return
 	}
 
-	// locabft: empty-block prevote guard (inactive, kept for reference).
-	/* txs := cs.ProposalBlock.Data.Txs.ToSliceOfBytes()
-	if len(txs) == 0 {
-		logger.Info("[locabft] defaultDoPrevote: rejecting empty block proposal")
-		return
-	} */
-
 	/*
 		Before prevoting on the block received from the proposer for the current round and height,
 		we request the Application, via `ProcessProposal` ABCI call, to confirm that the block is
@@ -2063,13 +2056,6 @@ func (cs *State) addProposalBlockPart(msg *BlockPartMessage, peerID p2p.ID) (add
 
 		cs.ProposalBlock = block
 
-		// locabft: empty-block guard at addProposalBlockPart (inactive, kept for reference).
-		/* txs := cs.ProposalBlock.Data.Txs.ToSliceOfBytes()
-		if len(txs) == 0 {
-			cs.Logger.Info("[locabft] addProposalBlockPart: rejecting empty block")
-			return false, nil
-		}
-		*/
 		// NOTE: it's possible to receive complete proposal blocks for future rounds without having the proposal
 		cs.Logger.Info("received complete proposal block", "height", cs.ProposalBlock.Height, "hash", cs.ProposalBlock.Hash())
 

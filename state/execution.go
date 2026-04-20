@@ -43,12 +43,6 @@ type BlockExecutor struct {
 	logger log.Logger
 
 	metrics *Metrics
-
-	// locabft: startupBlockCommitted is set to true on the first applyBlock call
-	// in this node session. Used by ProcessProposal to gate empty-block rejection
-	// (see commented-out code below — currently inactive, consensus/state.go
-	// handles empty-block control via needCommitBlock instead).
-	startupBlockCommitted bool
 }
 
 type BlockExecutorOption func(executor *BlockExecutor)
@@ -169,22 +163,6 @@ func (blockExec *BlockExecutor) ProcessProposal(
 	block *types.Block,
 	state State,
 ) (bool, error) {
-
-	// locabft: empty-block rejection via ProcessProposal (inactive).
-	// consensus/state.go needCommitBlock is the active mechanism. This hook
-	// is kept here for reference in case a ProcessProposal-layer guard is
-	// needed in the future.
-	/* txs := block.Data.Txs.ToSliceOfBytes()
-	if len(txs) == 0 {
-		if blockExec.startupBlockCommitted {
-			blockExec.logger.Info("[locabft] ProcessProposal: rejecting empty block",
-				"height", block.Header.Height)
-			return false, nil
-		}
-		blockExec.logger.Info("[locabft] ProcessProposal: accepting empty block (pre-startup)",
-			"height", block.Header.Height)
-	} */
-
 	resp, err := blockExec.proxyApp.ProcessProposal(context.TODO(), &abci.RequestProcessProposal{
 		Hash:               block.Header.Hash(),
 		Height:             block.Header.Height,
@@ -242,9 +220,6 @@ func (blockExec *BlockExecutor) ApplyBlock(
 }
 
 func (blockExec *BlockExecutor) applyBlock(state State, blockID types.BlockID, block *types.Block) (State, error) {
-	// locabft: mark that a block has been committed this session.
-	blockExec.startupBlockCommitted = true
-
 	startTime := time.Now().UnixNano()
 	abciResponse, err := blockExec.proxyApp.FinalizeBlock(context.TODO(), &abci.RequestFinalizeBlock{
 		Hash:               block.Hash(),
