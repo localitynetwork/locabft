@@ -1,3 +1,70 @@
+# locabft — CometBFT fork by [Locality Network](https://github.com/localitynetwork)
+
+> **This is a fork of [CometBFT v0.38.17](https://github.com/cometbft/cometbft/tree/v0.38.17).**
+> It is used as the consensus engine for the [loca](https://github.com/localitynetwork/loca)
+> blockchain. The module path is kept as `github.com/cometbft/cometbft` — import via a
+> `replace` directive in your `go.mod`:
+>
+> ```go
+> github.com/cometbft/cometbft v0.38.17 => github.com/localitynetwork/locabft v0.38.17-loca.0
+> ```
+
+## Changes vs upstream CometBFT v0.38.17
+
+### Problem: infinite empty-block loop on Cosmos SDK chains
+
+The upstream `needProofBlock()` function returns `true` whenever the previous block's
+AppHash differs from the header. On Cosmos SDK chains, the `BeginBlocker` modules (mint,
+distribution, slashing, staking) modify the AppHash on **every** block — including empty
+ones. With `create_empty_blocks = false`, this caused CometBFT to produce empty blocks in
+an infinite loop, ignoring the configuration entirely.
+
+### Fix: `needCommitBlock` in `consensus/state.go`
+
+Replaces `needProofBlock` with a simpler function that only forces a block in three cases:
+
+1. **Genesis height** — so the initial AppHash is recorded in a block header.
+2. **After restart** — one empty "warm-up" block forces `FinalizeBlock`, refreshing Cosmos
+   SDK module state (mint, staking, distribution) before user transactions arrive. Without
+   this, txs submitted right after a node restart may be rejected against stale state.
+3. **After a block with transactions** — one empty "commit" block records the resulting
+   AppHash in the next header. Because this block has `NumTxs==0`, the rule does not apply
+   to the block after it, breaking the loop automatically.
+
+After case 3, the node waits for new transactions (or the keepalive interval expires).
+
+### Keepalive (`create_empty_blocks_interval`)
+
+When `create_empty_blocks = false` and `create_empty_blocks_interval` is set (e.g. `"1h"`),
+a timeout is scheduled each time the node enters wait mode. When it fires, one empty block
+is produced to keep the chain alive and prevent validator downtime penalties. The node then
+returns to wait mode and schedules the next keepalive.
+
+### Modified files
+
+| File | Change |
+|------|--------|
+| `consensus/state.go` | Replace `needProofBlock` with `needCommitBlock`; add `startupBlockCommitted` warm-up field; add `[locabft]` log messages |
+| `state/execution.go` | Add `startupBlockCommitted` field to `BlockExecutor` (inactive — kept for reference) |
+
+All fork-specific code is tagged with `locabft:` in comments and `[locabft]` in log
+messages, making it easy to identify changes with `grep` and to filter logs on validators:
+
+```bash
+docker logs val-hana 2>&1 | grep "\[locabft\]"
+```
+
+| Log message | Meaning |
+|-------------|---------|
+| `[locabft] startup block: warming ABCI app state` | First block after restart (warm-up) |
+| `[locabft] startup block: ABCI app state ready` | ABCI app state refreshed |
+| `[locabft] waiting for txs` | Node idle, waiting for transactions |
+| `[locabft] txs available, proposing block` | New txs in mempool |
+| `[locabft] commit block: recording AppHash after txs` | Empty block to record AppHash |
+| `[locabft] keepalive: interval elapsed, proposing empty block` | Periodic keepalive block |
+
+---
+
 # CometBFT
 
 [Byzantine-Fault Tolerant][bft] [State Machine Replication][smr]. Or
